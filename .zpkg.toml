@@ -1,7 +1,20 @@
 [package]
-name = "zed-pkg-test/upgrade-compatibility-tests"
+org = "zed-pkg-test"
+name = "upgrade-compatibility-tests"
 version = "0.1.0"
 type = "test-suite"
+description = "Forward/backward schema compatibility, migration round-trip, negotiation, snapshot replay, and destructive-change guard tests."
+license = "MIT"
+
+[package.repository]
+vcs = "git"
+url = "https://github.com/zed-pkg-test/upgrade-compatibility-tests"
+
+[install]
+dir = ".vendor/.zed"
+
+[publish]
+exclude = ["artifacts/**", "vendor/**", ".vendor/**", ".env", ".env.*", "__pycache__/**", ".pytest_cache/**"]
 
 [develop]
 commands = [

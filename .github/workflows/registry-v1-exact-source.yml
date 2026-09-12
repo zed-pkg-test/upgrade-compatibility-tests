@@ -1,0 +1,80 @@
+name: Registry v1 exact-source compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZED_INTERFACES_REPO: zed-pkg/zed-interfaces
+  ZED_INTERFACES_SHA: b94055fea8bf360d0419ab6b7bff4ea39a6e5ef0
+  REGISTRY_PROTOCOL_BLOB_SHA: 6ea3a2c9ddd4f4599adc0f0276e96ccee38a8e5f
+
+jobs:
+  registry-v1-current-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout canary
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Checkout exact production contract source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.ZED_INTERFACES_REPO }}
+          ref: ${{ env.ZED_INTERFACES_SHA }}
+          path: .product/zed-interfaces
+          persist-credentials: false
+
+      - name: Verify immutable source and protocol identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          product=.product/zed-interfaces
+          actual_commit="$(git -C "$product" rev-parse HEAD)"
+          test "$actual_commit" = "$ZED_INTERFACES_SHA"
+
+          actual_blob="$(git -C "$product" hash-object src/rust/registry_protocol_v1.rs)"
+          test "$actual_blob" = "$REGISTRY_PROTOCOL_BLOB_SHA"
+
+          test -f "$product/docs/registry-protocol-v1.md"
+          test -f "$product/schemas/registry-discovery-v1.json"
+          test -f "$product/schemas/registry-checkpoint-v1.json"
+          test -f "$product/schemas/registry-index-record-v1.json"
+          test -f "$product/schemas/registry-index-snapshot-v1.json"
+          test -f "$product/schemas/registry-archive-manifest-v1.json"
+          test -f "$product/fixtures/registry-v1/discovery.json"
+          test -f "$product/fixtures/registry-v1/checkpoint.json"
+          test -f "$product/fixtures/registry-v1/index-snapshot.json"
+          test -f "$product/fixtures/registry-v1/index.ndjson"
+          test -f "$product/fixtures/registry-v1/archive-manifest.json"
+
+      - name: Run production registry-v1 trust and lifecycle contract tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test \
+            --manifest-path .product/zed-interfaces/Cargo.toml \
+            --locked \
+            registry_protocol_v1::tests:: \
+            -- --nocapture
+
+      - name: Record compatibility boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          product=.product/zed-interfaces
+          grep -F 'pub const REGISTRY_PROTOCOL_V1' "$product/src/rust/registry_protocol_v1.rs"
+          grep -F 'MissingProtocolVersion' "$product/src/rust/registry_protocol_v1.rs"
+          echo 'This canary certifies the current registry-v1 contract only.'
+          echo 'It does not claim N-1/N-2 registry-protocol support; unsupported versions must fail closed until immutable historical fixtures exist.'

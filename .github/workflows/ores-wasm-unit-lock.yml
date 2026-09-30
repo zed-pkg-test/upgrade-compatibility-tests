@@ -1,0 +1,269 @@
+name: ORES generated WASM unit lock proof
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ores-wasm-unit-lock.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prove-lock-boundary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: '1.88'
+          components: rustfmt, clippy
+
+      - name: Fetch exact ORES CLI revision
+        run: |
+          set -euo pipefail
+          git clone https://github.com/ores-stack/ores-stack-cli.git "$RUNNER_TEMP/ores-stack-cli"
+          git -C "$RUNNER_TEMP/ores-stack-cli" checkout cf14986e887a8bdf0f20aee7e80885e3c0c9bb11
+
+      - name: Apply exact generated-unit lock transform
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path(__import__('os').environ['RUNNER_TEMP']) / 'ores-stack-cli/crates/ores-stack-cli/src/lambda_wasm_unit.rs'
+          text = path.read_text()
+
+          old = '''    write_regular(&source_path, source_bytes)?;
+              write_regular(&wrapper_path, wrapper.as_bytes())?;
+              write_regular(&unit_manifest_path, manifest.as_bytes())?;
+          
+              let built = cargo_build_unit(
+          '''
+          new = '''    write_regular(&source_path, source_bytes)?;
+              write_regular(&wrapper_path, wrapper.as_bytes())?;
+              write_regular(&unit_manifest_path, manifest.as_bytes())?;
+              let _unit_lock_path = ensure_unit_lock(root, &unit_manifest_path)?;
+          
+              let built = cargo_build_unit(
+          '''
+          if old not in text:
+              raise SystemExit('materialization insertion anchor not found exactly once')
+          text = text.replace(old, new, 1)
+
+          helper_anchor = '''fn cargo_build_unit(
+          '''
+          helper = r'''const MAX_GENERATED_LOCK_BYTES: u64 = 4 * 1024 * 1024;
+
+          fn ensure_unit_lock(root: &Path, manifest_path: &Path) -> Result<PathBuf, String> {
+              let unit_dir = manifest_path
+                  .parent()
+                  .ok_or("generated WASM unit manifest has no parent directory")?;
+              let lock_path = unit_dir.join("Cargo.lock");
+              refuse_symlink_components(root, &lock_path)?;
+
+              match fs::symlink_metadata(&lock_path) {
+                  Ok(metadata) => {
+                      if metadata.file_type().is_symlink() || !metadata.is_file() {
+                          return Err(format!(
+                              "generated WASM unit lock {} must be a regular file",
+                              lock_path.display()
+                          ));
+                      }
+                  }
+                  Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                      let output = Command::new("cargo")
+                          .arg("generate-lockfile")
+                          .arg("--manifest-path")
+                          .arg(manifest_path)
+                          .current_dir(root)
+                          .stdin(Stdio::null())
+                          .stdout(Stdio::piped())
+                          .stderr(Stdio::piped())
+                          .output()
+                          .map_err(|error| {
+                              format!("could not launch generated WASM unit lock resolution: {error}")
+                          })?;
+                      if !output.status.success() {
+                          return Err(format!(
+                              "generated WASM unit lock resolution failed with {}; stderr: {}",
+                              output.status,
+                              truncate_utf8(&output.stderr, 8192)
+                          ));
+                      }
+                  }
+                  Err(error) => {
+                      return Err(format!(
+                          "could not inspect generated WASM unit lock {}: {error}",
+                          lock_path.display()
+                      ));
+                  }
+              }
+
+              refuse_symlink_components(root, &lock_path)?;
+              let metadata = fs::symlink_metadata(&lock_path).map_err(|error| {
+                  format!(
+                      "could not inspect generated WASM unit lock {}: {error}",
+                      lock_path.display()
+                  )
+              })?;
+              if metadata.file_type().is_symlink() || !metadata.is_file() {
+                  return Err(format!(
+                      "generated WASM unit lock {} must be a regular file",
+                      lock_path.display()
+                  ));
+              }
+              if metadata.len() == 0 || metadata.len() > MAX_GENERATED_LOCK_BYTES {
+                  return Err(format!(
+                      "generated WASM unit lock {} has invalid size {} bytes",
+                      lock_path.display(),
+                      metadata.len()
+                  ));
+              }
+
+              let output = Command::new("cargo")
+                  .arg("metadata")
+                  .arg("--locked")
+                  .arg("--format-version=1")
+                  .arg("--manifest-path")
+                  .arg(manifest_path)
+                  .current_dir(root)
+                  .stdin(Stdio::null())
+                  .stdout(Stdio::null())
+                  .stderr(Stdio::piped())
+                  .output()
+                  .map_err(|error| {
+                      format!("could not validate generated WASM unit lock: {error}")
+                  })?;
+              if !output.status.success() {
+                  return Err(format!(
+                      "generated WASM unit lock is stale or incomplete; stderr: {}",
+                      truncate_utf8(&output.stderr, 8192)
+                  ));
+              }
+              return Ok(lock_path);
+          }
+
+          '''
+          if text.count(helper_anchor) != 1:
+              raise SystemExit('cargo_build_unit anchor count mismatch')
+          text = text.replace(helper_anchor, helper + helper_anchor, 1)
+
+          old_build = '''    command
+                  .arg("build")
+                  .arg("--release")
+          '''
+          new_build = '''    command
+                  .arg("build")
+                  .arg("--locked")
+                  .arg("--release")
+          '''
+          if old_build not in text:
+              raise SystemExit('cargo build anchor not found')
+          text = text.replace(old_build, new_build, 1)
+
+          test_anchor = '''    #[test]
+              fn git_dependency_requires_pin() {
+          '''
+          tests = r'''    #[test]
+              fn generated_unit_lock_is_sticky_and_fail_closed() -> Result<(), String> {
+                  let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+                  let root = directory.path().canonicalize().map_err(|error| error.to_string())?;
+                  let unit = root.join("unit");
+                  fs::create_dir(&unit).map_err(|error| error.to_string())?;
+                  let manifest = unit.join("Cargo.toml");
+                  write_regular(
+                      &manifest,
+                      b"[package]\nname = \"ores-lock-test\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
+                  )?;
+
+                  let lock = ensure_unit_lock(&root, &manifest)?;
+                  let first = fs::read(&lock).map_err(|error| error.to_string())?;
+                  assert!(!first.is_empty());
+                  assert_eq!(ensure_unit_lock(&root, &manifest)?, lock);
+                  assert_eq!(fs::read(&lock).map_err(|error| error.to_string())?, first);
+
+                  let dependency = root.join("dep");
+                  fs::create_dir(&dependency).map_err(|error| error.to_string())?;
+                  write_regular(
+                      &dependency.join("Cargo.toml"),
+                      b"[package]\nname = \"local-dep\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                  )?;
+                  fs::create_dir(dependency.join("src")).map_err(|error| error.to_string())?;
+                  write_regular(&dependency.join("src/lib.rs"), b"pub fn value() -> u8 { 1 }\n")?;
+                  write_regular(
+                      &manifest,
+                      b"[package]\nname = \"ores-lock-test\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\nlocal-dep = { path = \"../dep\" }\n",
+                  )?;
+                  assert!(ensure_unit_lock(&root, &manifest).is_err());
+                  return Ok(());
+              }
+
+              #[cfg(unix)]
+              #[test]
+              fn generated_unit_lock_rejects_symlinks() -> Result<(), String> {
+                  use std::os::unix::fs::symlink;
+
+                  let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+                  let root = directory.path().canonicalize().map_err(|error| error.to_string())?;
+                  let unit = root.join("unit");
+                  fs::create_dir(&unit).map_err(|error| error.to_string())?;
+                  let manifest = unit.join("Cargo.toml");
+                  write_regular(
+                      &manifest,
+                      b"[package]\nname = \"ores-lock-test\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
+                  )?;
+                  let target = root.join("outside.lock");
+                  write_regular(&target, b"not a lock\n")?;
+                  symlink(&target, unit.join("Cargo.lock")).map_err(|error| error.to_string())?;
+                  assert!(ensure_unit_lock(&root, &manifest).is_err());
+                  assert_eq!(fs::read(&target).map_err(|error| error.to_string())?, b"not a lock\n");
+                  return Ok(());
+              }
+
+          '''
+          if text.count(test_anchor) != 1:
+              raise SystemExit('test anchor count mismatch')
+          text = text.replace(test_anchor, tests + test_anchor, 1)
+
+          path.write_text(text)
+          PY
+          git -C "$RUNNER_TEMP/ores-stack-cli" diff --check
+
+      - name: Format transformed ORES source
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ores-stack-cli"
+          cargo fmt --all
+          git diff --check
+
+      - name: Run focused generated-unit lock tests
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ores-stack-cli"
+          cargo test --locked -p ores-stack-cli generated_unit_lock -- --nocapture
+
+      - name: Run full CLI test suite
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ores-stack-cli"
+          cargo test --locked -p ores-stack-cli
+
+      - name: Strict Clippy on CLI
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ores-stack-cli"
+          cargo clippy --locked -p ores-stack-cli --all-targets -- -D warnings -A clippy::needless-return
+
+      - name: Prove transform is limited to intended source
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ores-stack-cli"
+          changed="$(git diff --name-only)"
+          test "$changed" = 'crates/ores-stack-cli/src/lambda_wasm_unit.rs'
+          git diff --stat
+          git diff -- crates/ores-stack-cli/src/lambda_wasm_unit.rs

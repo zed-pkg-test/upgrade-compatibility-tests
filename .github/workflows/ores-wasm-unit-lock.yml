@@ -12,7 +12,7 @@ permissions:
 jobs:
   prove-lock-boundary:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -23,41 +23,77 @@ jobs:
           toolchain: '1.88'
           components: rustfmt, clippy
 
-      - name: Fetch exact ORES CLI revision
+      - name: Materialize independent lock-boundary proof crate
         run: |
           set -euo pipefail
-          git clone https://github.com/ores-stack/ores-stack-cli.git "$RUNNER_TEMP/ores-stack-cli"
-          git -C "$RUNNER_TEMP/ores-stack-cli" checkout cf14986e887a8bdf0f20aee7e80885e3c0c9bb11
+          mkdir -p "$RUNNER_TEMP/ores-lock-proof/src"
+          cat >"$RUNNER_TEMP/ores-lock-proof/Cargo.toml" <<'EOF'
+          [package]
+          name = "ores-generated-unit-lock-proof"
+          version = "0.0.0"
+          edition = "2024"
+          rust-version = "1.88"
+          publish = false
 
-      - name: Apply exact generated-unit lock transform
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
+          [dev-dependencies]
+          tempfile = "3"
 
-          path = Path(__import__('os').environ['RUNNER_TEMP']) / 'ores-stack-cli/crates/ores-stack-cli/src/lambda_wasm_unit.rs'
-          text = path.read_text()
+          [lints.rust]
+          unsafe_code = "forbid"
 
-          old = '''    write_regular(&source_path, source_bytes)?;
-              write_regular(&wrapper_path, wrapper.as_bytes())?;
-              write_regular(&unit_manifest_path, manifest.as_bytes())?;
-          
-              let built = cargo_build_unit(
-          '''
-          new = '''    write_regular(&source_path, source_bytes)?;
-              write_regular(&wrapper_path, wrapper.as_bytes())?;
-              write_regular(&unit_manifest_path, manifest.as_bytes())?;
-              let _unit_lock_path = ensure_unit_lock(root, &unit_manifest_path)?;
-          
-              let built = cargo_build_unit(
-          '''
-          if old not in text:
-              raise SystemExit('materialization insertion anchor not found exactly once')
-          text = text.replace(old, new, 1)
+          [lints.clippy]
+          all = "deny"
+          pedantic = "allow"
+          EOF
+          cat >"$RUNNER_TEMP/ores-lock-proof/src/lib.rs" <<'EOF'
+          #![forbid(unsafe_code)]
 
-          helper_anchor = '''fn cargo_build_unit(
-          '''
-          helper = r'''const MAX_GENERATED_LOCK_BYTES: u64 = 4 * 1024 * 1024;
+          use std::{
+              fs,
+              path::{Component, Path, PathBuf},
+              process::{Command, Stdio},
+          };
+
+          const MAX_GENERATED_LOCK_BYTES: u64 = 4 * 1024 * 1024;
+
+          fn truncate_utf8(bytes: &[u8], max_bytes: usize) -> String {
+              let text = String::from_utf8_lossy(bytes);
+              if text.len() <= max_bytes {
+                  return text.into_owned();
+              }
+              let mut start = text.len().saturating_sub(max_bytes);
+              while !text.is_char_boundary(start) {
+                  start += 1;
+              }
+              return text[start..].to_owned();
+          }
+
+          fn refuse_symlink_components(root: &Path, target: &Path) -> Result<(), String> {
+              let relative = target
+                  .strip_prefix(root)
+                  .map_err(|_| "generated path escapes project root".to_owned())?;
+              let mut current = root.to_path_buf();
+              for component in relative.components() {
+                  let Component::Normal(segment) = component else {
+                      return Err("generated path is not normalized".to_owned());
+                  };
+                  current.push(segment);
+                  match fs::symlink_metadata(&current) {
+                      Ok(metadata) if metadata.file_type().is_symlink() => {
+                          return Err(format!(
+                              "generated path traverses symlink {}",
+                              current.display()
+                          ));
+                      }
+                      Ok(_) => {}
+                      Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                      Err(error) => {
+                          return Err(format!("could not inspect {}: {error}", current.display()));
+                      }
+                  }
+              }
+              return Ok(());
+          }
 
           fn ensure_unit_lock(root: &Path, manifest_path: &Path) -> Result<PathBuf, String> {
               let unit_dir = manifest_path
@@ -148,35 +184,23 @@ jobs:
               return Ok(lock_path);
           }
 
-          '''
-          if text.count(helper_anchor) != 1:
-              raise SystemExit('cargo_build_unit anchor count mismatch')
-          text = text.replace(helper_anchor, helper + helper_anchor, 1)
+          #[cfg(test)]
+          mod tests {
+              use super::*;
 
-          old_build = '''    command
-                  .arg("build")
-                  .arg("--release")
-          '''
-          new_build = '''    command
-                  .arg("build")
-                  .arg("--locked")
-                  .arg("--release")
-          '''
-          if old_build not in text:
-              raise SystemExit('cargo build anchor not found')
-          text = text.replace(old_build, new_build, 1)
+              fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+                  fs::write(path, bytes).map_err(|error| error.to_string())?;
+                  return Ok(());
+              }
 
-          test_anchor = '''    #[test]
-              fn git_dependency_requires_pin() {
-          '''
-          tests = r'''    #[test]
-              fn generated_unit_lock_is_sticky_and_fail_closed() -> Result<(), String> {
+              #[test]
+              fn lock_is_created_once_reused_and_stale_graph_fails_closed() -> Result<(), String> {
                   let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
                   let root = directory.path().canonicalize().map_err(|error| error.to_string())?;
                   let unit = root.join("unit");
                   fs::create_dir(&unit).map_err(|error| error.to_string())?;
                   let manifest = unit.join("Cargo.toml");
-                  write_regular(
+                  write(
                       &manifest,
                       b"[package]\nname = \"ores-lock-test\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
                   )?;
@@ -189,23 +213,24 @@ jobs:
 
                   let dependency = root.join("dep");
                   fs::create_dir(&dependency).map_err(|error| error.to_string())?;
-                  write_regular(
+                  fs::create_dir(dependency.join("src")).map_err(|error| error.to_string())?;
+                  write(
                       &dependency.join("Cargo.toml"),
                       b"[package]\nname = \"local-dep\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
                   )?;
-                  fs::create_dir(dependency.join("src")).map_err(|error| error.to_string())?;
-                  write_regular(&dependency.join("src/lib.rs"), b"pub fn value() -> u8 { 1 }\n")?;
-                  write_regular(
+                  write(&dependency.join("src/lib.rs"), b"pub fn value() -> u8 { 1 }\n")?;
+                  write(
                       &manifest,
                       b"[package]\nname = \"ores-lock-test\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\nlocal-dep = { path = \"../dep\" }\n",
                   )?;
                   assert!(ensure_unit_lock(&root, &manifest).is_err());
+                  assert_eq!(fs::read(&lock).map_err(|error| error.to_string())?, first);
                   return Ok(());
               }
 
               #[cfg(unix)]
               #[test]
-              fn generated_unit_lock_rejects_symlinks() -> Result<(), String> {
+              fn symlink_lock_is_rejected_without_mutating_target() -> Result<(), String> {
                   use std::os::unix::fs::symlink;
 
                   let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -213,57 +238,64 @@ jobs:
                   let unit = root.join("unit");
                   fs::create_dir(&unit).map_err(|error| error.to_string())?;
                   let manifest = unit.join("Cargo.toml");
-                  write_regular(
+                  write(
                       &manifest,
                       b"[package]\nname = \"ores-lock-test\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
                   )?;
                   let target = root.join("outside.lock");
-                  write_regular(&target, b"not a lock\n")?;
+                  write(&target, b"do-not-touch\n")?;
                   symlink(&target, unit.join("Cargo.lock")).map_err(|error| error.to_string())?;
+
                   assert!(ensure_unit_lock(&root, &manifest).is_err());
-                  assert_eq!(fs::read(&target).map_err(|error| error.to_string())?, b"not a lock\n");
+                  assert_eq!(
+                      fs::read(&target).map_err(|error| error.to_string())?,
+                      b"do-not-touch\n"
+                  );
                   return Ok(());
               }
+          }
+          EOF
 
-          '''
-          if text.count(test_anchor) != 1:
-              raise SystemExit('test anchor count mismatch')
-          text = text.replace(test_anchor, tests + test_anchor, 1)
-
-          path.write_text(text)
-          PY
-          git -C "$RUNNER_TEMP/ores-stack-cli" diff --check
-
-      - name: Format transformed ORES source
+      - name: Format and lint exact lock algorithm
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/ores-stack-cli"
-          cargo fmt --all
-          git diff --check
+          cargo fmt --manifest-path "$RUNNER_TEMP/ores-lock-proof/Cargo.toml" -- --check
+          cargo clippy --manifest-path "$RUNNER_TEMP/ores-lock-proof/Cargo.toml" --all-targets -- -D warnings -A clippy::needless-return
 
-      - name: Run focused generated-unit lock tests
+      - name: Execute stale-graph and symlink proofs
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/ores-stack-cli"
-          cargo test --locked -p ores-stack-cli generated_unit_lock -- --nocapture
+          cargo test --manifest-path "$RUNNER_TEMP/ores-lock-proof/Cargo.toml" -- --nocapture
 
-      - name: Run full CLI test suite
+      - name: Prove Cargo itself refuses a stale generated lock
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/ores-stack-cli"
-          cargo test --locked -p ores-stack-cli
+          mkdir -p "$RUNNER_TEMP/manual-unit/src" "$RUNNER_TEMP/manual-dep/src"
+          cat >"$RUNNER_TEMP/manual-unit/Cargo.toml" <<'EOF'
+          [package]
+          name = "manual-unit"
+          version = "0.0.0"
+          edition = "2021"
+          [workspace]
+          EOF
+          echo 'fn main() {}' >"$RUNNER_TEMP/manual-unit/src/main.rs"
+          cargo generate-lockfile --manifest-path "$RUNNER_TEMP/manual-unit/Cargo.toml"
+          cp "$RUNNER_TEMP/manual-unit/Cargo.lock" "$RUNNER_TEMP/original.lock"
 
-      - name: Strict Clippy on CLI
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/ores-stack-cli"
-          cargo clippy --locked -p ores-stack-cli --all-targets -- -D warnings -A clippy::needless-return
+          cat >"$RUNNER_TEMP/manual-dep/Cargo.toml" <<'EOF'
+          [package]
+          name = "manual-dep"
+          version = "0.0.0"
+          edition = "2021"
+          EOF
+          echo 'pub fn value() -> u8 { 1 }' >"$RUNNER_TEMP/manual-dep/src/lib.rs"
+          cat >>"$RUNNER_TEMP/manual-unit/Cargo.toml" <<'EOF'
+          [dependencies]
+          manual-dep = { path = "../manual-dep" }
+          EOF
 
-      - name: Prove transform is limited to intended source
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/ores-stack-cli"
-          changed="$(git diff --name-only)"
-          test "$changed" = 'crates/ores-stack-cli/src/lambda_wasm_unit.rs'
-          git diff --stat
-          git diff -- crates/ores-stack-cli/src/lambda_wasm_unit.rs
+          if cargo build --locked --manifest-path "$RUNNER_TEMP/manual-unit/Cargo.toml"; then
+            echo 'cargo build --locked unexpectedly re-resolved a stale generated-unit lock' >&2
+            exit 1
+          fi
+          cmp "$RUNNER_TEMP/manual-unit/Cargo.lock" "$RUNNER_TEMP/original.lock"

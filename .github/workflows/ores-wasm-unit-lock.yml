@@ -193,17 +193,24 @@ jobs:
                   return Ok(());
               }
 
-              #[test]
-              fn lock_is_created_once_reused_and_stale_graph_fails_closed() -> Result<(), String> {
-                  let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
-                  let root = directory.path().canonicalize().map_err(|error| error.to_string())?;
+              fn create_unit(root: &Path) -> Result<(PathBuf, PathBuf), String> {
                   let unit = root.join("unit");
                   fs::create_dir(&unit).map_err(|error| error.to_string())?;
+                  fs::create_dir(unit.join("src")).map_err(|error| error.to_string())?;
+                  write(&unit.join("src/lib.rs"), b"pub fn value() -> u8 { 0 }\n")?;
                   let manifest = unit.join("Cargo.toml");
                   write(
                       &manifest,
                       b"[package]\nname = \"ores-lock-test\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
                   )?;
+                  return Ok((unit, manifest));
+              }
+
+              #[test]
+              fn lock_is_created_once_reused_and_stale_graph_fails_closed() -> Result<(), String> {
+                  let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+                  let root = directory.path().canonicalize().map_err(|error| error.to_string())?;
+                  let (_unit, manifest) = create_unit(&root)?;
 
                   let lock = ensure_unit_lock(&root, &manifest)?;
                   let first = fs::read(&lock).map_err(|error| error.to_string())?;
@@ -235,13 +242,7 @@ jobs:
 
                   let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
                   let root = directory.path().canonicalize().map_err(|error| error.to_string())?;
-                  let unit = root.join("unit");
-                  fs::create_dir(&unit).map_err(|error| error.to_string())?;
-                  let manifest = unit.join("Cargo.toml");
-                  write(
-                      &manifest,
-                      b"[package]\nname = \"ores-lock-test\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
-                  )?;
+                  let (unit, manifest) = create_unit(&root)?;
                   let target = root.join("outside.lock");
                   write(&target, b"do-not-touch\n")?;
                   symlink(&target, unit.join("Cargo.lock")).map_err(|error| error.to_string())?;

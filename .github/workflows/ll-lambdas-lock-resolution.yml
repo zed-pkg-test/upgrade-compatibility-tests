@@ -1,0 +1,78 @@
+name: Lunatic Lambda lock resolution
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ll-lambdas-lock-resolution.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lock-compatibility:
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.90', '1.96']
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: wasm32-wasip1
+
+      - name: Materialize exact ll-lambdas manifest snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ll-lambdas-lock/src"
+          cat >"$RUNNER_TEMP/ll-lambdas-lock/Cargo.toml" <<'EOF'
+          [package]
+          name = "ll-lambda"
+          version = "0.1.0"
+          edition = "2021"
+          description = "Fresh-per-invocation Lunatic WASM actor for lunatic-lorry"
+
+          [dependencies]
+          lunatic = "0.14.1"
+          serde = { version = "1", features = ["derive"] }
+          serde_json = "1"
+          sha2 = "0.10"
+          thiserror = "2"
+
+          [lints.rust]
+          unsafe_code = "deny"
+          unused_must_use = "deny"
+
+          [lints.clippy]
+          unwrap_used = "deny"
+          expect_used = "deny"
+          panic = "deny"
+          todo = "deny"
+          unimplemented = "deny"
+          EOF
+          cat >"$RUNNER_TEMP/ll-lambdas-lock/src/main.rs" <<'EOF'
+          fn main() {}
+          EOF
+
+      - name: Resolve and prove locked wasm32-wasip1 dependency graph
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ll-lambdas-lock"
+          cargo generate-lockfile
+          cargo metadata --locked --format-version=1 >/dev/null
+          cargo check --locked --target wasm32-wasip1
+          sha256sum Cargo.lock
+
+      - name: Emit candidate production lockfile
+        if: matrix.rust == '1.96'
+        run: |
+          set -euo pipefail
+          echo '--- LL_LAMBDAS_CARGO_LOCK_BEGIN ---'
+          cat "$RUNNER_TEMP/ll-lambdas-lock/Cargo.lock"
+          echo '--- LL_LAMBDAS_CARGO_LOCK_END ---'
